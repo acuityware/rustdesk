@@ -101,7 +101,7 @@ async fn accept_connection_(server: ServerPtr, socket: Stream, secure: bool) -> 
 async fn check_privacy_mode_on(stream: &mut Stream) -> ResultType<()> {
     if video_service::get_privacy_mode_conn_id() > 0 {
         let msg_out =
-            crate::common::make_privacy_mode_msg(back_notification::PrivacyModeState::OnByOther);
+            crate::common::make_privacy_mode_msg(back_notification::PrivacyModeState::PrvOnByOther);
         timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
     }
     Ok(())
@@ -307,12 +307,26 @@ pub fn check_zombie() {
     });
 }
 
+/// Start the host server that allows the remote peer to control the current machine.
+/// 
+/// # Arguments
+/// 
+/// * `is_server` - Whether the current client is definitely the server.
+/// If true, the server will be started.
+/// Otherwise, client will check if there's already a server and start one if not.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 #[tokio::main]
 pub async fn start_server(is_server: bool) {
     crate::RendezvousMediator::start_all().await;
 }
 
+/// Start the host server that allows the remote peer to control the current machine.
+/// 
+/// # Arguments
+/// 
+/// * `is_server` - Whether the current client is definitely the server.
+/// If true, the server will be started.
+/// Otherwise, client will check if there's already a server and start one if not.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tokio::main]
 pub async fn start_server(is_server: bool) {

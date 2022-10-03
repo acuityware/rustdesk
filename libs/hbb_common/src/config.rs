@@ -1,15 +1,3 @@
-use crate::{
-    log,
-    password_security::config::{
-        decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
-        encrypt_vec_or_original,
-    },
-};
-use anyhow::Result;
-use directories_next::ProjectDirs;
-use rand::Rng;
-use serde_derive::{Deserialize, Serialize};
-use sodiumoxide::crypto::sign;
 use std::{
     collections::HashMap,
     fs,
@@ -19,8 +7,23 @@ use std::{
     time::SystemTime,
 };
 
+use anyhow::Result;
+use directories_next::ProjectDirs;
+use rand::Rng;
+use serde_derive::{Deserialize, Serialize};
+use sodiumoxide::crypto::sign;
+
+use crate::{
+    log,
+    password_security::{
+        decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
+        encrypt_vec_or_original,
+    },
+};
+
 pub const RENDEZVOUS_TIMEOUT: u64 = 12_000;
 pub const CONNECT_TIMEOUT: u64 = 18_000;
+pub const READ_TIMEOUT: u64 = 30_000;
 pub const REG_INTERVAL: i64 = 12_000;
 pub const COMPRESS_LEVEL: i32 = 3;
 const SERIAL: i32 = 3;
@@ -46,17 +49,13 @@ lazy_static::lazy_static! {
     pub static ref ONLINE: Arc<Mutex<HashMap<String, i64>>> = Default::default();
     pub static ref PROD_RENDEZVOUS_SERVER: Arc<RwLock<String>> = Default::default();
     pub static ref APP_NAME: Arc<RwLock<String>> = Arc::new(RwLock::new("RustDesk".to_owned()));
+    static ref KEY_PAIR: Arc<Mutex<Option<(Vec<u8>, Vec<u8>)>>> = Default::default();
+    static ref HW_CODEC_CONFIG: Arc<RwLock<HwCodecConfig>> = Arc::new(RwLock::new(HwCodecConfig::load()));
 }
-#[cfg(target_os = "android")]
-lazy_static::lazy_static! {
-    pub static ref APP_DIR: Arc<RwLock<String>> = Arc::new(RwLock::new("/data/user/0/com.carriez.flutter_hbb/app_flutter".to_owned()));
-}
-#[cfg(target_os = "ios")]
+
+// #[cfg(any(target_os = "android", target_os = "ios"))]
 lazy_static::lazy_static! {
     pub static ref APP_DIR: Arc<RwLock<String>> = Default::default();
-}
-#[cfg(any(target_os = "android", target_os = "ios"))]
-lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: Arc<RwLock<String>> = Default::default();
 }
 const CHARS: &'static [char] = &[
@@ -69,6 +68,7 @@ pub const RENDEZVOUS_SERVERS: &'static [&'static str] = &[
     "rs-sg.rustdesk.com",
     "rs-cn.rustdesk.com",
 ];
+pub const RS_PUB_KEY: &'static str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
 
@@ -81,13 +81,15 @@ pub enum NetworkType {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config {
     #[serde(default)]
-    pub id: String,
+    pub id: String, // use
+    #[serde(default)]
+    enc_id: String, // store
     #[serde(default)]
     password: String,
     #[serde(default)]
     salt: String,
     #[serde(default)]
-    pub key_pair: (Vec<u8>, Vec<u8>), // sk, pk
+    key_pair: (Vec<u8>, Vec<u8>), // sk, pk
     #[serde(default)]
     key_confirmed: bool,
     #[serde(default)]
@@ -217,7 +219,8 @@ impl Config2 {
     fn load() -> Config2 {
         let mut config = Config::load_::<Config2>("2");
         if let Some(mut socks) = config.socks {
-            let (password, store) = decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
+            let (password, _, store) =
+                decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
             socks.password = password;
             config.socks = Some(socks);
             if store {
@@ -268,6 +271,11 @@ pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + s
     cfg
 }
 
+#[inline]
+pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultType<()> {
+    Ok(confy::store_path(path, cfg)?)
+}
+
 impl Config {
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
@@ -283,15 +291,49 @@ impl Config {
 
     fn store_<T: serde::Serialize>(config: &T, suffix: &str) {
         let file = Self::file_(suffix);
-        if let Err(err) = confy::store_path(file, config) {
+        if let Err(err) = store_path(file, config) {
             log::error!("Failed to store config: {}", err);
         }
     }
 
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
-        let (password, store) = decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
+        let mut store = false;
+        let (password, _, store1) = decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
         config.password = password;
+        store |= store1;
+        let mut id_valid = false;
+        let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
+        if encrypted {
+            config.id = id;
+            id_valid = true;
+            store |= store2;
+        } else {
+            if crate::get_modified_time(&Self::file_(""))
+                .checked_sub(std::time::Duration::from_secs(30)) // allow modification during installation
+                .unwrap_or(crate::get_exe_time())
+                < crate::get_exe_time()
+            {
+                if !config.id.is_empty()
+                    && config.enc_id.is_empty()
+                    && !decrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION).1
+                {
+                    id_valid = true;
+                    store = true;
+                }
+            }
+        }
+        if !id_valid {
+            for _ in 0..3 {
+                if let Some(id) = Config::get_auto_id() {
+                    config.id = id;
+                    store = true;
+                    break;
+                } else {
+                    log::error!("Failed to generate new id");
+                }
+            }
+        }
         if store {
             config.store();
         }
@@ -301,6 +343,8 @@ impl Config {
     fn store(&self) {
         let mut config = self.clone();
         config.password = encrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
+        config.enc_id = encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION);
+        config.id = "".to_owned();
         Config::store_(&config, "");
     }
 
@@ -311,6 +355,10 @@ impl Config {
     fn file_(suffix: &str) -> PathBuf {
         let name = format!("{}{}", *APP_NAME.read().unwrap(), suffix);
         Config::with_extension(Self::path(name))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        (self.id.is_empty() && self.enc_id.is_empty()) || self.key_pair.0.is_empty()
     }
 
     pub fn get_home() -> PathBuf {
@@ -534,9 +582,9 @@ impl Config {
         }
     }
 
-    pub fn get_auto_password() -> String {
+    pub fn get_auto_password(length: usize) -> String {
         let mut rng = rand::thread_rng();
-        (0..6)
+        (0..length)
             .map(|_| CHARS[rng.gen::<usize>() % CHARS.len()])
             .collect()
     }
@@ -574,24 +622,26 @@ impl Config {
         config.store();
     }
 
-    pub fn set_key_pair(pair: (Vec<u8>, Vec<u8>)) {
-        let mut config = CONFIG.write().unwrap();
-        if config.key_pair == pair {
-            return;
-        }
-        config.key_pair = pair;
-        config.store();
-    }
-
     pub fn get_key_pair() -> (Vec<u8>, Vec<u8>) {
         // lock here to make sure no gen_keypair more than once
-        let mut config = CONFIG.write().unwrap();
+        // no use of CONFIG directly here to ensure no recursive calling in Config::load because of password dec which calling this function
+        let mut lock = KEY_PAIR.lock().unwrap();
+        if let Some(p) = lock.as_ref() {
+            return p.clone();
+        }
+        let mut config = Config::load_::<Config>("");
         if config.key_pair.0.is_empty() {
             let (pk, sk) = sign::gen_keypair();
-            config.key_pair = (sk.0.to_vec(), pk.0.into());
-            config.store();
+            let key_pair = (sk.0.to_vec(), pk.0.into());
+            config.key_pair = key_pair.clone();
+            std::thread::spawn(|| {
+                let mut config = CONFIG.write().unwrap();
+                config.key_pair = key_pair;
+                config.store();
+            });
         }
-        config.key_pair.clone()
+        *lock = Some(config.key_pair.clone());
+        return config.key_pair;
     }
 
     pub fn get_id() -> String {
@@ -657,7 +707,7 @@ impl Config {
         log::info!("id updated from {} to {}", id, new_id);
     }
 
-    pub fn set_security_password(password: &str) {
+    pub fn set_permanent_password(password: &str) {
         let mut config = CONFIG.write().unwrap();
         if password == config.password {
             return;
@@ -666,7 +716,7 @@ impl Config {
         config.store();
     }
 
-    pub fn get_security_password() -> String {
+    pub fn get_permanent_password() -> String {
         CONFIG.read().unwrap().password.clone()
     }
 
@@ -682,7 +732,7 @@ impl Config {
     pub fn get_salt() -> String {
         let mut salt = CONFIG.read().unwrap().salt.clone();
         if salt.is_empty() {
-            salt = Config::get_auto_password();
+            salt = Config::get_auto_password(6);
             Config::set_salt(&salt);
         }
         salt
@@ -742,17 +792,17 @@ impl PeerConfig {
             Ok(config) => {
                 let mut config: PeerConfig = config;
                 let mut store = false;
-                let (password, store2) =
+                let (password, _, store2) =
                     decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
                 config.password = password;
                 store = store || store2;
                 config.options.get_mut("rdp_password").map(|v| {
-                    let (password, store2) = decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
+                    let (password, _, store2) = decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
                     *v = password;
                     store = store || store2;
                 });
                 config.options.get_mut("os-password").map(|v| {
-                    let (password, store2) = decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
+                    let (password, _, store2) = decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
                     *v = password;
                     store = store || store2;
                 });
@@ -780,7 +830,7 @@ impl PeerConfig {
             .options
             .get_mut("os-password")
             .map(|v| *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION));
-        if let Err(err) = confy::store_path(Self::path(id), config) {
+        if let Err(err) = store_path(Self::path(id), config) {
             log::error!("Failed to store config: {}", err);
         }
     }
@@ -914,13 +964,18 @@ impl LocalConfig {
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct DiscoveryPeer {
+    #[serde(default)]
     pub id: String,
-    #[serde(with = "serde_with::rust::map_as_tuple_list")]
-    pub ip_mac: HashMap<String, String>,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub hostname: String,
+    #[serde(default)]
     pub platform: String,
+    #[serde(default)]
     pub online: bool,
+    #[serde(default)]
+    pub ip_mac: HashMap<String, String>,
 }
 
 impl DiscoveryPeer {
@@ -950,7 +1005,7 @@ impl LanPeers {
         let f = LanPeers {
             peers: peers.clone(),
         };
-        if let Err(err) = confy::store_path(Config::file_("_lan_peers"), f) {
+        if let Err(err) = store_path(Config::file_("_lan_peers"), f) {
             log::error!("Failed to store lan peers: {}", err);
         }
     }
@@ -981,6 +1036,16 @@ impl HwCodecConfig {
 
     pub fn remove() {
         std::fs::remove_file(Config::file_("_hwcodec")).ok();
+    }
+
+    /// refresh current global HW_CODEC_CONFIG, usually uesd after HwCodecConfig::remove()
+    pub fn refresh() {
+        *HW_CODEC_CONFIG.write().unwrap() = HwCodecConfig::load();
+        log::debug!("HW_CODEC_CONFIG refreshed successfully");
+    }
+
+    pub fn get() -> HwCodecConfig {
+        return HW_CODEC_CONFIG.read().unwrap().clone();
     }
 }
 

@@ -1,12 +1,12 @@
 pub mod compress;
-pub mod protos;
 pub mod platform;
-pub use  protos::message as message_proto;
-pub use  protos::rendezvous as rendezvous_proto;
+pub mod protos;
 pub use bytes;
 use config::Config;
 pub use futures;
 pub use protobuf;
+pub use protos::message as message_proto;
+pub use protos::rendezvous as rendezvous_proto;
 use std::{
     fs::File,
     io::{self, BufRead},
@@ -38,6 +38,8 @@ pub use tokio_socks;
 pub use tokio_socks::IntoTargetAddr;
 pub use tokio_socks::TargetAddr;
 pub mod password_security;
+pub use chrono;
+pub use directories_next;
 
 #[cfg(feature = "quic")]
 pub type Stream = quic::Connection;
@@ -202,12 +204,38 @@ pub fn get_modified_time(path: &std::path::Path) -> SystemTime {
         .unwrap_or(UNIX_EPOCH)
 }
 
+pub fn get_created_time(path: &std::path::Path) -> SystemTime {
+    std::fs::metadata(&path)
+        .map(|m| m.created().unwrap_or(UNIX_EPOCH))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+pub fn get_exe_time() -> SystemTime {
+    std::env::current_exe().map_or(UNIX_EPOCH, |path| {
+        let m = get_modified_time(&path);
+        let c = get_created_time(&path);
+        if m > c {
+            m
+        } else {
+            c
+        }
+    })
+}
+
 pub fn get_uuid() -> Vec<u8> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if let Ok(id) = machine_uid::get() {
         return id.into();
     }
     Config::get_key_pair().1
+}
+
+#[inline]
+pub fn get_time() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0) as _
 }
 
 #[cfg(test)]
